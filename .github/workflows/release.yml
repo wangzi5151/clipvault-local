@@ -31,7 +31,14 @@ jobs:
           go-version: "1.24"
           cache: true
       - name: vet + test
-        run: go vet ./... && go test ./...
+        # unsafeptr: Win32 的 GlobalLock 把已锁定的内存指针以 uintptr 返回，
+        # 转回 unsafe.Pointer 是标准写法（上游 golang.design/x/clipboard 亦如此），
+        # 但会触发 go vet unsafeptr 启发式误报；仅 Windows 关闭该单项检查，其余保留。
+        shell: bash
+        run: |
+          flags=""
+          if [ "$RUNNER_OS" = "Windows" ]; then flags="-unsafeptr=false"; fi
+          go vet $flags ./... && go test ./...
       - name: build static sidecar
         run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags="-s -w" -o clipvault-core${{ matrix.goos == 'windows' && '.exe' || '' }} .
         shell: bash
@@ -61,12 +68,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: sidecar-${{ matrix.goos }}
-          path: /tmp/sidecar
+          # 用 runner.temp 而非 /tmp：Windows 上 Node 写的 /tmp 与 Git Bash 的 /tmp 不是同一目录
+          path: ${{ runner.temp }}/sidecar
       - name: place sidecar binary
         shell: bash
         run: |
           mkdir -p app/src-tauri/binaries
-          cp /tmp/sidecar/clipvault-core${{ matrix.ext }} \
+          cp "${{ runner.temp }}/sidecar/clipvault-core${{ matrix.ext }}" \
              app/src-tauri/binaries/clipvault-core-${{ matrix.triple }}${{ matrix.ext }}
           ls -la app/src-tauri/binaries
       - name: install Linux webkit deps
@@ -99,7 +107,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path portable/ClipVault-Local | Out-Null
           Copy-Item app/src-tauri/target/release/ClipVault-Local.exe portable/ClipVault-Local/
-          Copy-Item /tmp/sidecar/clipvault-core.exe portable/ClipVault-Local/
+          Copy-Item "${{ runner.temp }}/sidecar/clipvault-core.exe" portable/ClipVault-Local/
           Copy-Item README.md portable/ClipVault-Local/使用说明.txt
           Compress-Archive -Path portable/ClipVault-Local -DestinationPath ClipVault-Local-${{ github.ref_name }}-portable-win64.zip
       - name: upload portable zip

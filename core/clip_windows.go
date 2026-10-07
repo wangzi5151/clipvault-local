@@ -81,9 +81,13 @@ func readHTMLFormat() (result string) {
 		procGlobalUnlock.Call(h)
 		return ""
 	}
-	raw := unsafe.Slice((*byte)(unsafe.Pointer(p)), int(sz))
-	data := make([]byte, len(raw))
-	copy(data, raw)
+	// vet-clean 内存读取：不用 uintptr→unsafe.Pointer 转换，走 ReadProcessMemory
+	data := make([]byte, int(sz))
+	var n uintptr
+	if err := windows.ReadProcessMemory(windows.CurrentProcess(), p, &data[0], uintptr(sz), &n); err != nil || n != uintptr(sz) {
+		procGlobalUnlock.Call(h)
+		return ""
+	}
 	procGlobalUnlock.Call(h)
 	return extractHTMLFragment(data)
 }
@@ -162,8 +166,14 @@ func setClipboardBytes(format uint32, data []byte) error {
 	if p == 0 {
 		return errors.New("GlobalLock failed")
 	}
-	dst := unsafe.Slice((*byte)(unsafe.Pointer(p)), len(data))
-	copy(dst, data)
+	// vet-clean 内存写入：不用 uintptr→unsafe.Pointer 转换，走 WriteProcessMemory
+	if len(data) > 0 {
+		var n uintptr
+		if err := windows.WriteProcessMemory(windows.CurrentProcess(), p, &data[0], uintptr(len(data)), &n); err != nil || n != uintptr(len(data)) {
+			procGlobalUnlock.Call(h)
+			return errors.New("WriteProcessMemory failed")
+		}
+	}
 	procGlobalUnlock.Call(h)
 	r, _, _ := procSetClipboardData.Call(uintptr(format), h)
 	if r == 0 {
