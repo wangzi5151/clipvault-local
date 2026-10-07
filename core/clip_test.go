@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/png"
 	"testing"
+	"time"
 
 	clipboard "golang.design/x/clipboard"
 )
@@ -83,11 +84,17 @@ func TestClipboardUnavailable(t *testing.T) {
 		t.Skipf("no clipboard in this environment (expected headless): %v", err)
 	}
 	// Display present: sanity-check text roundtrip via the library.
+	// On headless Windows sessions Init can succeed yet Write never completes
+	// (the library needs a pumping message loop), so bound the wait.
 	done := clipboard.Write(clipboard.FmtText, []byte("clipvault-test"))
 	if done != nil {
-		<-done
-		if got := clipboard.Read(clipboard.FmtText); string(got) != "clipvault-test" {
-			t.Fatalf("clipboard roundtrip failed: %q", got)
+		select {
+		case <-done:
+			if got := clipboard.Read(clipboard.FmtText); string(got) != "clipvault-test" {
+				t.Fatalf("clipboard roundtrip failed: %q", got)
+			}
+		case <-time.After(10 * time.Second):
+			t.Skip("clipboard write did not complete (headless session?)")
 		}
 	}
 }
