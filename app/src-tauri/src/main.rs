@@ -162,8 +162,15 @@ fn spawn_core(app: &AppHandle, bridge_holder: &Arc<Mutex<Option<Arc<CoreBridge>>
 // 托盘
 // ---------------------------------------------------------------------------
 
-const ICON_RECORDING: &[u8] = include_bytes!("icons/tray-recording.png");
-const ICON_PAUSED: &[u8] = include_bytes!("icons/tray-paused.png");
+const ICON_RECORDING: &[u8] = include_bytes!("../icons/tray-recording.png");
+const ICON_PAUSED: &[u8] = include_bytes!("../icons/tray-paused.png");
+
+fn tray_icon(recording: bool) -> Option<tauri::image::Image<'static>> {
+    let bytes = tray_icon_bytes(recording);
+    let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(tauri::image::Image::new_owned(rgba.into_raw(), w, h))
+}
 
 fn tray_icon_bytes(recording: bool) -> Vec<u8> {
     if recording { ICON_RECORDING.to_vec() } else { ICON_PAUSED.to_vec() }
@@ -184,7 +191,7 @@ fn rebuild_tray(app: &AppHandle, recording: bool) {
         .unwrap();
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_menu(Some(menu));
-        if let Ok(img) = tauri::image::Image::from_bytes(&tray_icon_bytes(recording)) {
+        if let Some(img) = tray_icon(recording) {
             let _ = tray.set_icon(Some(img));
         }
         let _ = tray.set_tooltip(Some(if recording {
