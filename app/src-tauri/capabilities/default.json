@@ -1,0 +1,1 @@
+{"$schema":"../gen/schemas/desktop-schema.json","description":"ClipVault-Local：前端只需要事件监听与窗口基础能力，其余走 Rust 命令","identifier":"default","permissions":["core:window:default","core:event:default"],"windows":["main","popup","settings"]}

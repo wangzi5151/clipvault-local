@@ -1,0 +1,110 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # ---- 第 1 步：交叉编译 Go 核心（纯 Go，无 cgo，单静态文件）----
+  sidecar:
+    name: sidecar-${{ matrix.goos }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - name: vet + test
+        run: go vet ./... && go test ./...
+      - name: build static sidecar
+        run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags="-s -w" -o clipvault-core${{ matrix.goos == 'windows' && '.exe' || '' }} .
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidecar-${{ matrix.goos }}
+          path: core/clipvault-core*
+
+  # ---- 第 2 步：Tauri 打包（Windows: MSI + NSIS；Linux: deb + AppImage）----
+  build:
+    name: tauri-${{ matrix.goos }}
+    needs: sidecar
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            goos: windows
+            triple: x86_64-pc-windows-msvc
+            ext: .exe
+          - os: ubuntu-22.04
+            goos: linux
+            triple: x86_64-unknown-linux-gnu
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sidecar-${{ matrix.goos }}
+          path: /tmp/sidecar
+      - name: place sidecar binary
+        shell: bash
+        run: |
+          mkdir -p app/src-tauri/binaries
+          cp /tmp/sidecar/clipvault-core${{ matrix.ext }} \
+             app/src-tauri/binaries/clipvault-core-${{ matrix.triple }}${{ matrix.ext }}
+          ls -la app/src-tauri/binaries
+      - name: install Linux webkit deps
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: build + release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: app
+          tagName: ${{ github.ref_name }}
+          releaseName: "ClipVault-Local ${{ github.ref_name }}"
+          releaseBody: |
+            纯本地剪贴板历史保险箱，零网络、零账号、零广告。
+
+            Windows 用户：下载 .msi 安装，或下载 portable 绿色版解压即用。
+            Linux 用户：下载 .deb 安装，或下载 .AppImage 直接运行。
+
+            快速上手见 README。
+          releaseDraft: false
+          prerelease: false
+      # ---- Windows 便携绿色版：exe + sidecar 打包成 zip ----
+      - name: portable zip (Windows)
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path portable/ClipVault-Local | Out-Null
+          Copy-Item app/src-tauri/target/release/ClipVault-Local.exe portable/ClipVault-Local/
+          Copy-Item /tmp/sidecar/clipvault-core.exe portable/ClipVault-Local/
+          Copy-Item README.md portable/ClipVault-Local/使用说明.txt
+          Compress-Archive -Path portable/ClipVault-Local -DestinationPath ClipVault-Local-${{ github.ref_name }}-portable-win64.zip
+      - name: upload portable zip
+        if: matrix.goos == 'windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ClipVault-Local-*-portable-win64.zip

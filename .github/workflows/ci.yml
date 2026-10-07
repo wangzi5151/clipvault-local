@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ["v*"]
+  pull_request:
+
+jobs:
+  go-core:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - run: go vet ./...
+      - run: go test ./...
+      - run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/clipvault-core .
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: syntax check js
+        run: |
+          for f in app/dist/js/*.js; do node --check "$f" && echo "OK $f"; done
+      - name: validate tauri.conf.json
+        run: python3 -c "import json; json.load(open('app/src-tauri/tauri.conf.json')); print('tauri.conf.json OK')"
