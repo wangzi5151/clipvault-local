@@ -18,12 +18,15 @@ func testApp(t *testing.T, dir string) *App {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
-	return &App{
+	app := &App{
 		emitter: newEmitter(json.NewEncoder(io.Discard)),
 		store:   s,
 		pending: make(map[string]*pendingCapture),
 	}
+	// importBackup swaps app.store for a fresh handle; always close the
+	// current one so no db file handle leaks (Windows TempDir cleanup).
+	t.Cleanup(func() { app.store.Close() })
+	return app
 }
 
 func TestBackupRoundtrip(t *testing.T) {
