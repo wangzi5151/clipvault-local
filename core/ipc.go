@@ -4,8 +4,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 )
 
 // JSON-RPC 2.0 over newline-delimited stdio (IPC.md).
@@ -476,20 +480,39 @@ func (a *App) mSetSettings(patch map[string]any) (any, *rpcError) {
 	if err != nil {
 		return nil, appErr(err)
 	}
-	st, err := a.store.UpdateSettings(patch)
-	if err != nil {
-		return nil, rpcErr(errInvalidParams, err.Error())
+
+	// db_dir is not a plain setting: switching it moves the whole database.
+	// Apply every other key first so the migrated copy already carries them.
+	rawDBDir, changeDBDir := patch[skDBDir]
+	rest := patch
+	if changeDBDir {
+		rest = make(map[string]any, len(patch)-1)
+		for k, v := range patch {
+			if k != skDBDir {
+				rest[k] = v
+			}
+		}
 	}
-	// db_dir change -> reopen the database at the new location.
-	if st.DBDir != old.DBDir {
-		if rerr := a.reopenDatabase(st.DBDir); rerr != nil {
+	st := old
+	if len(rest) > 0 {
+		st, err = a.store.UpdateSettings(rest)
+		if err != nil {
+			return nil, rpcErr(errInvalidParams, err.Error())
+		}
+	}
+
+	if changeDBDir {
+		dir, ok := rawDBDir.(string)
+		if !ok {
+			return nil, rpcErr(errInvalidParams, "setting db_dir must be a string")
+		}
+		var rerr *rpcError
+		st, rerr = a.switchDatabase(dir)
+		if rerr != nil {
 			return nil, rerr
 		}
-		// re-read settings from the new DB for an accurate merged view
-		if st2, err := a.store.GetSettings(); err == nil {
-			st = st2
-		}
 	}
+
 	if st.Recording != old.Recording {
 		a.event("state_changed", map[string]any{"recording": st.Recording})
 	}
@@ -570,22 +593,181 @@ func (a *App) mSetDBPassword(password string) (any, *rpcError) {
 	return map[string]any{"ok": true, "db_password_set": set}, nil
 }
 
-// reopenDatabase switches the store to a new directory (settings.db_dir change).
-func (a *App) reopenDatabase(dbDir string) *rpcError {
-	dir := dbDir
-	if dir == "" {
-		dir = defaultDBDir()
+// sameDir compares two directory paths, tolerating relative paths and
+// Windows' case-insensitive filesystems.
+func sameDir(a, b string) bool {
+	if aa, err := filepath.Abs(a); err == nil {
+		a = aa
 	}
-	if err := ensureDir(dir); err != nil {
-		return rpcErr(errApp, fmt.Sprintf("cannot create db dir: %v", err))
+	if bb, err := filepath.Abs(b); err == nil {
+		b = bb
 	}
-	newPath := filepath.Join(dir, "clipvault.db")
-	old := a.store
-	ns, err := OpenStore(newPath)
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if isWindows() {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+// switchDatabase makes dbDir the active database directory and returns the
+// settings stored there. The current database is migrated (VACUUM INTO
+// snapshot) to the new directory so nothing is silently left behind.
+//
+// db_dir is the one setting that also acts as the startup pointer: the
+// default database must remember a custom location so the next launch can
+// find it again. Resetting to "" therefore moves the data back to the
+// default directory and clears that pointer.
+func (a *App) switchDatabase(dbDir string) (Settings, *rpcError) {
+	defDir := defaultDBDir()
+	targetDir := dbDir
+	if targetDir == "" {
+		targetDir = defDir
+	}
+	targetDir, err := filepath.Abs(targetDir)
 	if err != nil {
-		return rpcErr(errApp, fmt.Sprintf("cannot open database at %s: %v", newPath, err))
+		return Settings{}, rpcErr(errApp, fmt.Sprintf("bad db dir: %v", err))
 	}
-	a.swapStore(old, ns)
-	logf("database moved to %s", newPath)
-	return nil
+	defDir, err = filepath.Abs(defDir)
+	if err != nil {
+		return Settings{}, rpcErr(errApp, fmt.Sprintf("cannot resolve default db dir: %v", err))
+	}
+	toDefault := sameDir(targetDir, defDir)
+	marker := targetDir
+	if toDefault {
+		marker = ""
+	}
+
+	a.mu.RLock()
+	cur := a.store
+	a.mu.RUnlock()
+	curDir := filepath.Dir(cur.Path())
+
+	if sameDir(targetDir, curDir) {
+		// Already there: just persist the canonical setting. Also repair the
+		// bootstrap pointer in case this directory was opened directly.
+		if _, err := cur.UpdateSettings(map[string]any{skDBDir: marker}); err != nil {
+			return Settings{}, rpcErr(errApp, err.Error())
+		}
+		if !toDefault {
+			if err := writeDBDirPointer(defDir, targetDir); err != nil {
+				logf("db_dir: could not update default pointer in %s: %v", defDir, err)
+			}
+		}
+		return a.currentSettings()
+	}
+
+	if err := ensureDir(targetDir); err != nil {
+		return Settings{}, rpcErr(errApp, fmt.Sprintf("cannot create db dir: %v", err))
+	}
+	targetPath := filepath.Join(targetDir, "clipvault.db")
+
+	// Keep a safety copy of an existing custom database before replacing it.
+	if !toDefault {
+		if fi, err := os.Stat(targetPath); err == nil && fi.Size() > 0 {
+			backup := fmt.Sprintf("%s.pre-switch-%d", targetPath, time.Now().UnixMilli())
+			if err := copyFile(targetPath, backup); err != nil {
+				logf("db_dir: could not back up existing target %s: %v", targetPath, err)
+			}
+		}
+	}
+
+	a.mu.Lock()
+	old := a.store
+	oldPath := old.Path()
+
+	// Snapshot while the old handle is still open (consistent, includes WAL).
+	_ = os.Remove(targetPath)
+	_ = os.Remove(targetPath + "-wal")
+	_ = os.Remove(targetPath + "-shm")
+	if err := old.vacuumInto(targetPath); err != nil {
+		a.mu.Unlock()
+		return Settings{}, rpcErr(errApp, fmt.Sprintf("cannot migrate database to %s: %v", targetPath, err))
+	}
+	// Keep an unlocked encrypted database unlocked across the move.
+	old.mu.Lock()
+	var oldKey []byte
+	if old.key != nil {
+		oldKey = append([]byte(nil), old.key...)
+	}
+	old.mu.Unlock()
+	if err := old.Close(); err != nil {
+		if reopened, rerr := OpenStore(oldPath); rerr == nil {
+			a.store = reopened
+		}
+		a.mu.Unlock()
+		return Settings{}, rpcErr(errApp, fmt.Sprintf("cannot close old database: %v", err))
+	}
+
+	ns, err := OpenStore(targetPath)
+	if err != nil {
+		// Put the old database back so the app keeps working.
+		if reopened, rerr := OpenStore(oldPath); rerr == nil {
+			a.store = reopened
+		}
+		a.mu.Unlock()
+		return Settings{}, rpcErr(errApp, fmt.Sprintf("cannot open database at %s: %v", targetPath, err))
+	}
+	if oldKey != nil && ns.salt != nil {
+		ns.mu.Lock()
+		ns.key = oldKey
+		ns.mu.Unlock()
+	}
+	a.store = ns
+	a.mu.Unlock()
+
+	if _, err := ns.UpdateSettings(map[string]any{skDBDir: marker}); err != nil {
+		return Settings{}, rpcErr(errApp, fmt.Sprintf("cannot save db_dir in new database: %v", err))
+	}
+
+	// The default database is the bootstrap pointer. Keep it in sync so a
+	// custom directory survives a restart and resetting to default sticks.
+	if !toDefault {
+		if err := writeDBDirPointer(defDir, targetDir); err != nil {
+			logf("db_dir: could not update default pointer in %s: %v", defDir, err)
+		}
+	}
+	logf("database moved to %s", targetPath)
+	return a.currentSettings()
+}
+
+// currentSettings re-reads settings from the active store.
+func (a *App) currentSettings() (Settings, *rpcError) {
+	st, err := a.getStore().GetSettings()
+	if err != nil {
+		return Settings{}, appErr(err)
+	}
+	return st, nil
+}
+
+// writeDBDirPointer records target in the default database's db_dir setting.
+func writeDBDirPointer(defaultDir, target string) error {
+	if err := ensureDir(defaultDir); err != nil {
+		return err
+	}
+	s, err := OpenStore(filepath.Join(defaultDir, "clipvault.db"))
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	_, err = s.UpdateSettings(map[string]any{skDBDir: target})
+	return err
+}
+
+// copyFile copies src to dst (used only for the safety backup above).
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	return out.Close()
 }

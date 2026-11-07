@@ -91,6 +91,9 @@ Rust 外壳收到事件后 `app.emit("core-event", payload)` 转发给前端；
 - `hotkey`: 前端录制，如 `"Shift+Super+V"`；空字符串 = 关闭全局热键。
   Rust 侧把 `Super` 映射为平台键（Win/Cmd）。
 - `skip_sensitive`: `"ask"` 弹出确认 / `"auto"` 自动跳过 / `"off"` 照常记录。
+- `db_dir`: `""` = 默认目录；非空 = 自定义目录。切换**立即生效**：core 会把当前数据库
+  快照迁移/复制到目标目录，在目标库写入新的 `db_dir`，并同步默认目录里的启动指针；
+  传 `""` 表示迁回默认目录并清除指针（不会静默丢数据）。
 - `lock_action`: `"none"` / `"pause"`（锁屏暂停记录） / `"clear"`（锁屏清空最近1小时）。
 - 设置密码走专用方法，不走 set_settings（避免日志残留）：
   - `set_db_password {password}` → 加密全库；`{password:""}` → 解密。

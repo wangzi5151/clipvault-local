@@ -19,7 +19,8 @@ jobs:
           go-version: "1.24"
           cache: true
       - run: go vet ./...
-      - run: go test ./...
+      - name: core regression tests
+        run: go test -count=1 ./...
       - run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/clipvault-core .
 
   frontend:
@@ -32,5 +33,13 @@ jobs:
       - name: syntax check js
         run: |
           for f in app/dist/js/*.js; do node --check "$f" && echo "OK $f"; done
-      - name: validate tauri.conf.json
-        run: python3 -c "import json; json.load(open('app/src-tauri/tauri.conf.json')); print('tauri.conf.json OK')"
+      - name: validate all json
+        run: |
+          python3 - <<'PY'
+          import glob, json
+          files = sorted(glob.glob('app/**/*.json', recursive=True))
+          for path in files:
+              with open(path, encoding='utf-8') as fh:
+                  json.load(fh)
+              print('OK', path)
+          PY

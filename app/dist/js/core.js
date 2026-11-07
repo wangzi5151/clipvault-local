@@ -402,4 +402,13 @@
   onEvent('core-event', function (payload) {
     if (payload && payload.event === 'core_error') toast('出错了：' + (payload.data && payload.data.message));
   });
+
+  // 全局：核心进程崩溃 / 自动重启状态
+  onEvent('core-event', function (payload) {
+    if (!payload || payload.event !== 'core_status') return;
+    var d = payload.data || {};
+    if (d.state === 'recovered') toast('核心进程已自动恢复');
+    else if (d.state === 'failed') toast(d.message || '核心进程已停止，请重启应用', true);
+    else if (d.message) toast(d.message, true);
+  });
 })();

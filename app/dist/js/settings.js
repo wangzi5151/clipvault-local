@@ -108,13 +108,13 @@
         if (!p) return;
         $('set-dbdir').value = p;
         save({ db_dir: p }, function () {
-          $('dbdir-hint').textContent = '当前数据库位置：' + p + '（下次启动生效）';
+          $('dbdir-hint').textContent = '当前数据库位置：' + p + '（已切换，数据已复制到新位置）';
         });
       });
     };
     $('btn-dbdir-reset').onclick = function () {
       $('set-dbdir').value = '';
-      save({ db_dir: '' }, function () { $('dbdir-hint').textContent = '当前数据库位置：默认（文档/ClipVault-Local 文件夹）'; });
+      save({ db_dir: '' }, function () { $('dbdir-hint').textContent = '当前数据库位置：默认（文档/ClipVault-Local 文件夹）（已恢复默认，数据已复制回来）'; });
     };
 
     $('btn-export-json').onclick = function () {

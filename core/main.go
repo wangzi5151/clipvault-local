@@ -51,15 +51,6 @@ func (a *App) getStore() *Store {
 	return a.store
 }
 
-func (a *App) swapStore(old, ns *Store) {
-	a.mu.Lock()
-	a.store = ns
-	a.mu.Unlock()
-	if old != nil {
-		_ = old.Close()
-	}
-}
-
 // defaultDBDir resolves the default database directory:
 //   - Windows/macOS: %USERPROFILE%/Documents/ClipVault-Local
 //   - Linux: ~/Documents/ClipVault-Local, falling back to

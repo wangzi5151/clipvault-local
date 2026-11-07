@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,13 +21,47 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 // ---------------------------------------------------------------------------
 
 struct CoreBridge {
-    stdin: Mutex<std::process::ChildStdin>,
+    stdin: Mutex<Option<std::process::ChildStdin>>,
     next_id: AtomicU64,
+    alive: AtomicBool,
     pending: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
 }
 
 impl CoreBridge {
+    fn new(stdin: std::process::ChildStdin) -> Self {
+        Self {
+            stdin: Mutex::new(Some(stdin)),
+            next_id: AtomicU64::new(0),
+            alive: AtomicBool::new(true),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    /// Mark the bridge unusable, drop the dead stdin and fail every pending
+    /// request immediately (instead of making each caller wait for a timeout).
+    fn invalidate(&self, reason: &str) -> bool {
+        if !self.alive.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        if let Ok(mut stdin) = self.stdin.lock() {
+            stdin.take();
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            for (_, tx) in pending.drain() {
+                let _ = tx.send(Err(reason.to_string()));
+            }
+        }
+        true
+    }
+
     async fn call(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        if !self.is_alive() {
+            return Err("核心进程已退出，正在自动重启".to_string());
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
@@ -38,15 +72,19 @@ impl CoreBridge {
             "jsonrpc": "2.0", "id": id, "method": method, "params": params,
         }))
         .map_err(|e| e.to_string())?;
-        {
-            let mut stdin = self.stdin.lock().map_err(|_| "内部锁错误".to_string())?;
-            let w = writeln!(stdin, "{}", line)
-                .and_then(|_| stdin.flush())
-                .map_err(|e| format!("核心进程写入失败: {}", e));
-            if w.is_err() {
-                self.pending.lock().ok().map(|mut p| p.remove(&id));
-                return w.map(|_| Value::Null);
+        let write_result = {
+            let mut guard = self.stdin.lock().map_err(|_| "内部锁错误".to_string())?;
+            match guard.as_mut() {
+                Some(stdin) => writeln!(stdin, "{}", line)
+                    .and_then(|_| stdin.flush())
+                    .map_err(|e| format!("核心进程写入失败: {}", e)),
+                None => Err("核心进程已退出，正在自动重启".to_string()),
             }
+        };
+        if let Err(err) = write_result {
+            self.pending.lock().ok().map(|mut p| p.remove(&id));
+            self.invalidate(&err);
+            return Err(err);
         }
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(r)) => r,
@@ -118,44 +156,108 @@ fn spawn_core(app: &AppHandle, bridge_holder: &Arc<Mutex<Option<Arc<CoreBridge>>
     let stdin = child.stdin.take().ok_or("无法接管核心进程输入")?;
     let stdout = child.stdout.take().ok_or("无法接管核心进程输出")?;
 
-    let bridge = Arc::new(CoreBridge {
-        stdin: Mutex::new(stdin),
-        next_id: AtomicU64::new(0),
-        pending: Mutex::new(HashMap::new()),
-    });
+    let bridge = Arc::new(CoreBridge::new(stdin));
     *bridge_holder.lock().map_err(|_| "内部锁错误".to_string())? = Some(bridge.clone());
 
-    // 读取线程：响应按 id 回填，事件转发给前端
+    // 读取线程：响应按 id 回填，事件转发给前端；EOF / 读取错误时标记失效并自动重启。
     let app2 = app.clone();
+    let holder = bridge_holder.clone();
+    let shutdown = app.state::<AppState>().shutdown.clone();
     std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            let v: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
-                let tx = bridge.pending.lock().ok().and_then(|mut p| p.remove(&id));
-                if let Some(tx) = tx {
-                    if let Some(err) = v.get("error") {
-                        let msg = err
-                            .get("message")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("核心返回错误");
-                        let _ = tx.send(Err(msg.to_string()));
-                    } else {
-                        let _ = tx.send(Ok(v.get("result").cloned().unwrap_or(Value::Null)));
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let v: Value = match serde_json::from_str(line.trim_end()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
+                        let tx = bridge.pending.lock().ok().and_then(|mut p| p.remove(&id));
+                        if let Some(tx) = tx {
+                            if let Some(err) = v.get("error") {
+                                let msg = err
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("核心返回错误");
+                                let _ = tx.send(Err(msg.to_string()));
+                            } else {
+                                let _ = tx.send(Ok(v.get("result").cloned().unwrap_or(Value::Null)));
+                            }
+                        }
+                    } else if let Some(ev) = v.get("event").and_then(|e| e.as_str()) {
+                        if ev == "state_changed" {
+                            update_tray_recording(&app2, v.get("data").and_then(|d| d.get("recording")).and_then(|r| r.as_bool()).unwrap_or(true));
+                        }
+                        let _ = app2.emit("core-event", &v);
                     }
                 }
-            } else if let Some(ev) = v.get("event").and_then(|e| e.as_str()) {
-                if ev == "state_changed" {
-                    update_tray_recording(&app2, v.get("data").and_then(|d| d.get("recording")).and_then(|r| r.as_bool()).unwrap_or(true));
+                Err(err) => {
+                    eprintln!("读取 clipvault-core 输出失败: {}", err);
+                    break;
                 }
-                let _ = app2.emit("core-event", &v);
             }
+        }
+
+        // stdin/stdout 已断开：让所有挂起请求立刻失败。只有当前 bridge
+        // 仍是活跃对象、且应用没在退出时才自动重启，避免重复重启/退出后复活。
+        bridge.invalidate("核心进程已退出");
+        let still_current = holder
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+            .map(|b| Arc::ptr_eq(&b, &bridge))
+            .unwrap_or(false);
+        if still_current && !shutdown.load(Ordering::Acquire) {
+            let _ = app2.emit(
+                "core-event",
+                json!({"event":"core_status","data":{"state":"exited","message":"核心进程已退出，正在自动重启"}}),
+            );
+            restart_core(app2, holder, shutdown);
         }
     });
     Ok(())
+}
+
+/// 安全自动重启：最多 5 次、指数退避，避免 sidecar 持续崩溃时刷爆 CPU。
+fn restart_core(
+    app: AppHandle,
+    holder: Arc<Mutex<Option<Arc<CoreBridge>>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let mut delay = Duration::from_millis(500);
+        for attempt in 1..=5u32 {
+            std::thread::sleep(delay);
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            match spawn_core(&app, &holder) {
+                Ok(()) => {
+                    let _ = app.emit(
+                        "core-event",
+                        json!({"event":"core_status","data":{"state":"recovered","attempt":attempt}}),
+                    );
+                    return;
+                }
+                Err(err) => {
+                    eprintln!("clipvault-core 第 {} 次自动重启失败: {}", attempt, err);
+                    let _ = app.emit(
+                        "core-event",
+                        json!({"event":"core_status","data":{"state":"restarting","attempt":attempt,"message":err}}),
+                    );
+                    delay = std::cmp::min(delay * 2, Duration::from_secs(5));
+                }
+            }
+        }
+        let _ = app.emit(
+            "core-event",
+            json!({"event":"core_status","data":{"state":"failed","message":"核心进程多次重启失败，请重启应用"}}),
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +315,7 @@ fn update_tray_recording(app: &AppHandle, recording: bool) {
 struct AppState {
     bridge: Arc<Mutex<Option<Arc<CoreBridge>>>>,
     recording: Arc<Mutex<bool>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +461,7 @@ fn pick_open_file(app: AppHandle) -> Result<Option<String>, String> {
 fn main() {
     let bridge_holder: Arc<Mutex<Option<Arc<CoreBridge>>>> = Arc::new(Mutex::new(None));
     let recording = Arc::new(Mutex::new(true));
+    let shutdown = Arc::new(AtomicBool::new(false));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -372,6 +476,7 @@ fn main() {
         .manage(AppState {
             bridge: bridge_holder.clone(),
             recording: recording.clone(),
+            shutdown: shutdown.clone(),
         })
         .setup(move |app| {
             // 1. 启动 Go 核心
@@ -449,7 +554,12 @@ fn main() {
                             }
                         });
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        app.state::<AppState>()
+                            .shutdown
+                            .store(true, Ordering::Release);
+                        app.exit(0)
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
